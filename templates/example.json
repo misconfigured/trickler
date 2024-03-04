@@ -1,0 +1,4 @@
+{
+    "name": "{{.FirstName}} {{.LastName}}",
+    "email": "{{.Email}}"
+}

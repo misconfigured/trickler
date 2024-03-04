@@ -1,0 +1,8 @@
+endpoints:
+  - url: "https://example.com/api"
+    method: "POST"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {EXAMPLE_API_TOKEN}"
+    body: "templates/example.json"
+    frequency: 60

@@ -1,0 +1,77 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trickler-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trickler
+  template:
+    metadata:
+      labels:
+        app: trickler
+    spec:
+      containers:
+      - name: trickler
+        image: trickler:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: STATSD_HOST
+          value: "statsd"
+        - name: STATSD_PORT
+          value: "8125"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trickler-service
+spec:
+  selector:
+    app: trickler
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statsd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: statsd
+  template:
+    metadata:
+      labels:
+        app: statsd
+    spec:
+      containers:
+      - name: statsd
+        image: graphiteapp/graphite-statsd
+        ports:
+        - containerPort: 8125
+          protocol: UDP
+        - containerPort: 80
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statsd
+spec:
+  selector:
+    app: statsd
+  ports:
+  - name: statsd
+    protocol: UDP
+    port: 8125
+    targetPort: 8125
+  - name: web
+    protocol: TCP
+    port: 80
+    targetPort: 80
