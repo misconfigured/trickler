@@ -40,6 +40,10 @@ type EndpointConfig struct {
 	Rate float64 `yaml:"rate"`
 	// Workers = max concurrent in-flight requests for this endpoint (default 512).
 	Workers int `yaml:"workers"`
+	// Protocol = h1 | h2 | h3 (aka quic). Default h1. Selects which HTTP protocol
+	// this endpoint drives, so we can exercise the edge's h2 multiplexing and
+	// h3/QUIC paths, not only HTTP/1.1.
+	Protocol string `yaml:"protocol"`
 }
 
 var log = logrus.New()
@@ -316,8 +320,9 @@ func sendOne(endpoint EndpointConfig) {
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
+	t.proto = normalizeProto(endpoint.Protocol)
 	start = time.Now()
-	response, err := httpClient.Do(req)
+	response, err := clientFor(t.proto).Do(req)
 	if err != nil {
 		t.total = time.Since(start)
 		t.record(endpoint, 0, "err")

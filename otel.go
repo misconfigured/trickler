@@ -95,6 +95,7 @@ type reqTiming struct {
 	dns, connect, tls, ttfb, total time.Duration
 	peerIP                         string // the EDGE IP this connection used
 	reused                         bool   // keepalive reuse (skips DNS+connect+TLS)
+	proto                          string // h1 | h2 | h3
 }
 
 // record emits the phase histograms + a request counter, dimensioned so SigNoz can
@@ -111,6 +112,7 @@ func (t reqTiming) record(ep EndpointConfig, code int, class string) {
 		attribute.String("status_class", class),
 		attribute.String("net.peer.ip", t.peerIP),
 		attribute.Bool("conn.reused", t.reused),
+		attribute.String("protocol", t.proto),
 	)
 	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
 	// DNS/connect/TLS are only non-zero on a FRESH connection; a reused keepalive
