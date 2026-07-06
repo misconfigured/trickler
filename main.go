@@ -3,10 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -21,15 +23,49 @@ type Config struct {
 }
 
 type EndpointConfig struct {
-	URL       string            `yaml:"url"`
-	Method    string            `yaml:"method"`
-	Headers   map[string]string `yaml:"headers"`
-	Body      string            `yaml:"body"`
-	Frequency int               `yaml:"frequency"`
+	URL     string            `yaml:"url"`
+	Method  string            `yaml:"method"`
+	Headers map[string]string `yaml:"headers"`
+	Body    string            `yaml:"body"`
+	// Frequency = legacy mode: one request every N SECONDS (min 1s). Kept for
+	// backward compatibility; IGNORED when Rate > 0.
+	Frequency int `yaml:"frequency"`
+	// Rate = requests per SECOND (sub-second capable). When > 0 this overrides
+	// Frequency and drives an async, worker-bounded send loop so a slow response
+	// never throttles the send rate (#175 load testing).
+	Rate float64 `yaml:"rate"`
+	// Workers = max concurrent in-flight requests for this endpoint (default 512).
+	Workers int `yaml:"workers"`
 }
 
 var log = logrus.New()
 var statsdClient *statsd.Client
+
+// A connection-pooling client so high request rates aren't bottlenecked on TCP/TLS
+// setup (the biggest cap on throughput). http.DefaultClient has no tuned transport.
+var httpClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        2000,
+		MaxIdleConnsPerHost: 1024,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
+	},
+}
+
+// Counters for the periodic achieved-rate reporter (#175).
+var (
+	cntSent    uint64
+	cntOK      uint64
+	cntFailed  uint64
+	cntDropped uint64
+)
+
+func incr(name string) {
+	if statsdClient != nil {
+		statsdClient.Increment(name)
+	}
+}
 
 func init() {
 	log.Formatter = &logrus.TextFormatter{
@@ -89,6 +125,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	go reportLoop()
 	for _, endpoint := range config.Endpoints {
 		go handleEndpoint(endpoint)
 	}
@@ -112,7 +149,7 @@ func loadConfig(configPath string) (*Config, error) {
 	replaceEnvVars(&config)
 
 	for _, endpoint := range config.Endpoints {
-		log.Printf("Loaded endpoint: URL=%s, Method=%s, Frequency=%ds", endpoint.URL, endpoint.Method, endpoint.Frequency)
+		log.Printf("Loaded endpoint: URL=%s Method=%s rate=%.1f/s frequency=%ds", endpoint.URL, endpoint.Method, endpoint.Rate, endpoint.Frequency)
 	}
 	return &config, nil
 }
@@ -146,45 +183,112 @@ func generatePayload(templatePath string) (string, error) {
 }
 
 func handleEndpoint(endpoint EndpointConfig) {
-	if endpoint.Frequency <= 0 {
-		log.Warnf("Invalid frequency for endpoint %s; must be greater than zero", endpoint.URL)
+	// Rate mode (#175): requests/sec, sub-second capable. Dispatch each request
+	// ASYNC (bounded by Workers) so a slow response never throttles the send rate —
+	// the legacy synchronous send capped one endpoint at ~1/latency.
+	if endpoint.Rate > 0 {
+		interval := time.Duration(float64(time.Second) / endpoint.Rate)
+		if interval < time.Microsecond {
+			interval = time.Microsecond
+		}
+		workers := endpoint.Workers
+		if workers <= 0 {
+			workers = 512
+		}
+		sem := make(chan struct{}, workers)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		log.Infof("endpoint %s: rate=%.1f req/s (interval %s, workers %d)", endpoint.URL, endpoint.Rate, interval, workers)
+		for range ticker.C {
+			select {
+			case sem <- struct{}{}:
+				go func() {
+					defer func() { <-sem }()
+					sendOne(endpoint)
+				}()
+			default:
+				// every worker busy → the target can't keep up at this rate.
+				atomic.AddUint64(&cntDropped, 1)
+				incr("endpoint.dropped")
+			}
+		}
 		return
 	}
 
+	// Legacy frequency mode: one request every N seconds.
+	if endpoint.Frequency <= 0 {
+		log.Warnf("endpoint %s has neither rate nor a positive frequency; skipping", endpoint.URL)
+		return
+	}
 	ticker := time.NewTicker(time.Duration(endpoint.Frequency) * time.Second)
 	defer ticker.Stop()
-
+	log.Infof("endpoint %s: frequency=%ds", endpoint.URL, endpoint.Frequency)
 	for range ticker.C {
+		sendOne(endpoint)
+	}
+}
+
+// sendOne builds, sends, and records one request. Safe to call concurrently.
+func sendOne(endpoint EndpointConfig) {
+	atomic.AddUint64(&cntSent, 1)
+	var bodyReader io.Reader
+	if endpoint.Body != "" {
 		payload, err := generatePayload(endpoint.Body)
 		if err != nil {
-			log.Errorf("Failed to generate payload for %s: %s", endpoint.URL, err)
-			continue
+			log.Errorf("payload gen for %s failed: %s", endpoint.URL, err)
+			atomic.AddUint64(&cntFailed, 1)
+			incr("endpoint.failure")
+			return
 		}
+		bodyReader = strings.NewReader(payload)
+	}
 
-		log.Debugf("Sending payload to %s: %s", endpoint.URL, payload)
+	req, err := http.NewRequest(endpoint.Method, endpoint.URL, bodyReader)
+	if err != nil {
+		log.Errorf("request build for %s failed: %s", endpoint.URL, err)
+		atomic.AddUint64(&cntFailed, 1)
+		incr("endpoint.failure")
+		return
+	}
+	for key, value := range endpoint.Headers {
+		req.Header.Set(key, value)
+	}
 
-		req, err := http.NewRequest(endpoint.Method, endpoint.URL, strings.NewReader(payload))
-		if err != nil {
-			log.Errorf("Failed to create request for %s: %s", endpoint.URL, err)
-			statsdClient.Increment("endpoint.failure")
-			continue
-		}
+	start := time.Now()
+	response, err := httpClient.Do(req)
+	if err != nil {
+		log.Errorf("request to %s failed: %s", endpoint.URL, err)
+		atomic.AddUint64(&cntFailed, 1)
+		incr("endpoint.failure")
+		return
+	}
+	// Drain + close so the connection is reused (keepalive) — essential for rate.
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
 
-		for key, value := range endpoint.Headers {
-			req.Header.Set(key, value)
-		}
-
-		response, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Errorf("Request to %s failed: %s", endpoint.URL, err)
-			continue
-		}
-		log.Infof("Request to %s Response Status: %s", endpoint.URL, response.Status)
-		statsdClient.Increment("endpoint.success")
-
+	atomic.AddUint64(&cntOK, 1)
+	incr("endpoint.success")
+	if statsdClient != nil {
 		statsdClient.Gauge("endpoint.response", float64(response.StatusCode))
+		statsdClient.Timing("endpoint.latency", int(time.Since(start).Milliseconds()))
+	}
+	log.Debugf("%s -> %s (%dms)", endpoint.URL, response.Status, time.Since(start).Milliseconds())
+}
 
-		response.Body.Close()
+// reportLoop logs the achieved send rate + outcome deltas every 5s, so a high-rate
+// run is legible at Info level without a log line per request.
+func reportLoop() {
+	var pSent, pOK, pFail, pDrop uint64
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		s := atomic.LoadUint64(&cntSent)
+		ok := atomic.LoadUint64(&cntOK)
+		f := atomic.LoadUint64(&cntFailed)
+		d := atomic.LoadUint64(&cntDropped)
+		log.Infof("trickle: %.0f req/s (ok=%d fail=%d dropped=%d /5s; totals sent=%d ok=%d fail=%d)",
+			float64(s-pSent)/5.0, ok-pOK, f-pFail, d-pDrop, s, ok, f)
+		pSent, pOK, pFail, pDrop = s, ok, f, d
 	}
 }
 

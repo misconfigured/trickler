@@ -1,8 +1,17 @@
+# Rate mode (#175 load testing): `rate` = requests/SECOND, sub-second capable, sent
+# async with a bounded worker pool so a slow response never throttles the rate.
+# Legacy `frequency` = one request every N seconds (used only when rate is unset).
 endpoints:
+  - url: "https://example.com/"
+    method: "GET"
+    headers:
+      User-Agent: "trickler"
+    rate: 50 # requests/sec (overrides frequency)
+    workers: 256 # max concurrent in-flight (optional; default 512)
   - url: "https://example.com/api"
     method: "POST"
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {EXAMPLE_API_TOKEN}"
     body: "templates/example.json"
-    frequency: 60
+    frequency: 60 # legacy per-N-seconds mode
