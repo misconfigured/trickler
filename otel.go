@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
@@ -147,7 +148,12 @@ func (l *lifetimeDialer) DialContext(ctx context.Context, network, addr string) 
 	if err != nil || l.maxLife <= 0 {
 		return c, err
 	}
-	return &deadlineConn{Conn: c, expiry: time.Now().Add(l.maxLife)}, nil
+	// Jitter each connection's lifetime across [maxLife/2, 3*maxLife/2). Without
+	// this, connections created together (e.g. at startup) all expire at once — a
+	// synchronized reconnect wave that craters throughput every maxLife seconds.
+	// Spreading retirements keeps re-resolution steady with no throughput dip.
+	life := l.maxLife/2 + time.Duration(rand.Int64N(int64(l.maxLife)))
+	return &deadlineConn{Conn: c, expiry: time.Now().Add(life)}, nil
 }
 
 // deadlineConn fails reads once past its expiry, so the Transport discards it and
