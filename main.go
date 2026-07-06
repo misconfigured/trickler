@@ -72,10 +72,16 @@ func buildHTTPClient() *http.Client {
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			DialContext:         dialer.DialContext,
-			MaxIdleConns:        2000,
-			MaxIdleConnsPerHost: 1024,
+			MaxIdleConns:        8000,
+			MaxIdleConnsPerHost: 4096,
 			IdleConnTimeout:     90 * time.Second,
-			ForceAttemptHTTP2:   true,
+			// Force HTTP/1.1: a load generator wants a FAT pool of independent
+			// connections (each ~= one client), not a few h2 conns multiplexing
+			// everything. That makes per-connection retirement graceful (retiring
+			// one conn drops <=1 in-flight request, not hundreds of h2 streams) and
+			// genuinely simulates many clients for the DNS-distribution test.
+			ForceAttemptHTTP2: false,
+			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
 		},
 	}
 }
